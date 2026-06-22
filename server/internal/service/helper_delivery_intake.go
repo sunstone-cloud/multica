@@ -61,8 +61,9 @@ func (s *IssueService) maybeApplyHelperDeliveryIntake(ctx context.Context, q *db
 
 	metadata := map[string]string{
 		"workflow":        "delivery",
-		"pipeline_mode":   "onestep",
+		"pipeline_mode":   "standard",
 		"pipeline_status": "intake",
+		"waiting_on":      "agent",
 		"current_stage":   "intake",
 		"intake_source":   "helper_delivery_create_hook",
 		"stage_summary":   "Helper-created delivery issue auto-routed to OneStep intake.",
