@@ -76,19 +76,46 @@ func TestCreateIssueHelperDeliveryAutoRoutesToOneStepIntake(t *testing.T) {
 		testHandler.DeleteIssue(httptest.NewRecorder(), cleanupReq)
 	})
 
-	var gotProjectID, assigneeType, assigneeID, workflow, pipelineStatus string
+	var gotProjectID, assigneeType, assigneeID, workflow, pipelineMode, pipelineStatus, waitingOn, currentStage, nextAction string
 	if err := testPool.QueryRow(ctx, `
-		SELECT project_id::text, assignee_type, assignee_id::text, metadata->>'workflow', metadata->>'pipeline_status'
+		SELECT
+			project_id::text,
+			assignee_type,
+			assignee_id::text,
+			metadata->>'workflow',
+			metadata->>'pipeline_mode',
+			metadata->>'pipeline_status',
+			metadata->>'waiting_on',
+			metadata->>'current_stage',
+			metadata->>'next_action'
 		FROM issue
 		WHERE id = $1
-	`, created.ID).Scan(&gotProjectID, &assigneeType, &assigneeID, &workflow, &pipelineStatus); err != nil {
+	`, created.ID).Scan(&gotProjectID, &assigneeType, &assigneeID, &workflow, &pipelineMode, &pipelineStatus, &waitingOn, &currentStage, &nextAction); err != nil {
 		t.Fatalf("load created issue: %v", err)
 	}
 	if gotProjectID != projectID || assigneeType != "squad" || assigneeID != squadID {
 		t.Fatalf("issue routing mismatch: project=%s assignee=%s/%s, want project=%s assignee=squad/%s", gotProjectID, assigneeType, assigneeID, projectID, squadID)
 	}
-	if workflow != "delivery" || pipelineStatus != "intake" {
-		t.Fatalf("metadata mismatch: workflow=%q pipeline_status=%q", workflow, pipelineStatus)
+	wantMetadata := map[string]string{
+		"workflow":        "delivery",
+		"pipeline_mode":   "standard",
+		"pipeline_status": "intake",
+		"waiting_on":      "agent",
+		"current_stage":   "intake",
+		"next_action":     "OneStep intake squad should classify and dispatch the delivery pipeline.",
+	}
+	gotMetadata := map[string]string{
+		"workflow":        workflow,
+		"pipeline_mode":   pipelineMode,
+		"pipeline_status": pipelineStatus,
+		"waiting_on":      waitingOn,
+		"current_stage":   currentStage,
+		"next_action":     nextAction,
+	}
+	for key, want := range wantMetadata {
+		if got := gotMetadata[key]; got != want {
+			t.Fatalf("metadata %s mismatch: got %q, want %q", key, got, want)
+		}
 	}
 
 	var commentContent string
