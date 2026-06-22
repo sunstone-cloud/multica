@@ -143,11 +143,12 @@ type IssueCreateResult struct {
 //  3. Lock & check the duplicate guard.
 //  4. Increment the workspace issue counter.
 //  5. Insert the issue row (with optional origin stamping).
-//  6. Commit.
-//  7. Link any pre-uploaded attachments (post-commit, idempotent).
-//  8. Publish EventIssueCreated to the bus (payload via opts.BroadcastPayload).
-//  9. Capture the IssueCreated analytics event.
-//  10. Enqueue an agent task or trigger the squad leader when the issue is
+//  6. Apply Helper-created delivery intake routing when configured.
+//  7. Commit.
+//  8. Link any pre-uploaded attachments (post-commit, idempotent).
+//  9. Publish EventIssueCreated to the bus (payload via opts.BroadcastPayload).
+//  10. Capture the IssueCreated analytics event.
+//  11. Enqueue an agent task or trigger the squad leader when the issue is
 //     assigned and not in `backlog`.
 //
 // Validation that lives in the service (parent existence, project
@@ -266,6 +267,11 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 	}
 	if err != nil {
 		return IssueCreateResult{}, fmt.Errorf("create issue: %w", err)
+	}
+
+	issue, err = s.maybeApplyHelperDeliveryIntake(ctx, qtx, issue, p)
+	if err != nil {
+		return IssueCreateResult{}, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
