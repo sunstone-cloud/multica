@@ -73,8 +73,22 @@ func runLogin(cmd *cobra.Command, args []string) error {
 }
 
 func autoWatchWorkspaces(cmd *cobra.Command) error {
-	serverURL := resolveServerURL(cmd)
-	token := resolveToken(cmd)
+	profile := resolveProfile(cmd)
+	cfg, err := cli.LoadCLIConfigForProfile(profile)
+	if err != nil {
+		return err
+	}
+
+	serverURL := strings.TrimSpace(cfg.ServerURL)
+	if serverURL == "" {
+		serverURL = resolveServerURL(cmd)
+	}
+	serverURL = normalizeAPIBaseURL(serverURL)
+
+	token := strings.TrimSpace(cfg.Token)
+	if token == "" {
+		token = resolveToken(cmd)
+	}
 	if token == "" {
 		return fmt.Errorf("not authenticated")
 	}
@@ -101,12 +115,6 @@ func autoWatchWorkspaces(cmd *cobra.Command) error {
 			fmt.Fprintln(os.Stderr, "\nNo workspaces found.")
 			return nil
 		}
-	}
-
-	profile := resolveProfile(cmd)
-	cfg, err := cli.LoadCLIConfigForProfile(profile)
-	if err != nil {
-		return err
 	}
 
 	// Set default workspace if not set.
