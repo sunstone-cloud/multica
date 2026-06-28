@@ -27,7 +27,7 @@ func TestCreateIssueHelperDeliveryAutoRoutesToOneStepIntake(t *testing.T) {
 	var projectID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO project (workspace_id, title, status, priority)
-		VALUES ($1, $2, 'in_progress', 'medium')
+		VALUES ($1, $2, 'active', 'medium')
 		RETURNING id
 	`, testWorkspaceID, "OneStep Intake Test").Scan(&projectID); err != nil {
 		t.Fatalf("create project: %v", err)
