@@ -227,40 +227,6 @@ func (q *Queries) ListProjectResourcesForProjects(ctx context.Context, projectId
 	return items, nil
 }
 
-const listWorkspacesWithGitHubProjectResources = `-- name: ListWorkspacesWithGitHubProjectResources :many
-SELECT workspace_id, resource_ref FROM project_resource
-WHERE resource_type = 'github_repo'
-ORDER BY workspace_id, position ASC, created_at ASC
-`
-
-type ListWorkspacesWithGitHubProjectResourcesRow struct {
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-	ResourceRef []byte      `json:"resource_ref"`
-}
-
-// Project github_repo resources are durable repo ownership context too. GitHub
-// webhook routing uses this alongside workspace.repos so project-bound repos
-// can still auto-link PRs to issues in the owning workspace.
-func (q *Queries) ListWorkspacesWithGitHubProjectResources(ctx context.Context) ([]ListWorkspacesWithGitHubProjectResourcesRow, error) {
-	rows, err := q.db.Query(ctx, listWorkspacesWithGitHubProjectResources)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListWorkspacesWithGitHubProjectResourcesRow{}
-	for rows.Next() {
-		var i ListWorkspacesWithGitHubProjectResourcesRow
-		if err := rows.Scan(&i.WorkspaceID, &i.ResourceRef); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const updateProjectResource = `-- name: UpdateProjectResource :one
 UPDATE project_resource
 SET resource_ref = $2,
