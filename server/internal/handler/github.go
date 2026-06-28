@@ -1227,13 +1227,14 @@ func parseGHTimeRequired(s string) pgtype.Timestamptz {
 
 const githubWebhookHost = "github.com"
 
-// resolveWorkspaceForRepo routes a delivery to the workspace whose repos
-// registry owns github.com/owner/name, so one installation can serve repos in
+// resolveWorkspaceForRepo routes a delivery to the workspace whose repo
+// context owns github.com/owner/name, so one installation can serve repos in
 // several workspaces; falls back to the installation workspace when unmatched.
-// The registry is admin-editable, so it overrides the verified installation
-// binding only when owner == the delivering account (accountLogin) and the host
-// matches — no cross-account capture. On ties the installation's own workspace
-// wins, else the lowest id (query is ORDER BY id).
+// Both workspace.repos and project github_repo resources are durable repo
+// context. They override the verified installation binding only when owner ==
+// the delivering account (accountLogin) and the host matches — no cross-account
+// capture. On ties the installation's own workspace wins, else the lowest id
+// (queries are ORDER BY stable ids / positions).
 func (h *Handler) resolveWorkspaceForRepo(ctx context.Context, fallback pgtype.UUID, accountLogin, owner, name string) pgtype.UUID {
 	owner = strings.TrimSpace(owner)
 	name = strings.TrimSpace(name)
@@ -1245,26 +1246,45 @@ func (h *Handler) resolveWorkspaceForRepo(ctx context.Context, fallback pgtype.U
 		return fallback
 	}
 	target := githubWebhookHost + "/" + strings.ToLower(owner) + "/" + strings.ToLower(name)
+	matches := make([]pgtype.UUID, 0, 1)
+
 	rows, err := h.Queries.ListWorkspacesWithRepos(ctx)
 	if err != nil {
 		slog.Warn("github: list workspaces with repos failed", "err", err)
-		return fallback
-	}
-	matches := make([]pgtype.UUID, 0, 1)
-	for _, row := range rows {
-		var repos []struct {
-			URL string `json:"url"`
-		}
-		if err := json.Unmarshal(row.Repos, &repos); err != nil {
-			continue
-		}
-		for _, rp := range repos {
-			if repoIdentityFromURL(rp.URL) == target {
-				matches = append(matches, row.ID)
-				break
+	} else {
+		for _, row := range rows {
+			var repos []struct {
+				URL string `json:"url"`
+			}
+			if err := json.Unmarshal(row.Repos, &repos); err != nil {
+				continue
+			}
+			for _, rp := range repos {
+				if repoIdentityFromURL(rp.URL) == target {
+					matches = appendWorkspaceMatch(matches, row.ID)
+					break
+				}
 			}
 		}
 	}
+
+	projectResources, err := h.Queries.ListWorkspacesWithGitHubProjectResources(ctx)
+	if err != nil {
+		slog.Warn("github: list project repo resources failed", "err", err)
+	} else {
+		for _, row := range projectResources {
+			var ref struct {
+				URL string `json:"url"`
+			}
+			if err := json.Unmarshal(row.ResourceRef, &ref); err != nil {
+				continue
+			}
+			if repoIdentityFromURL(ref.URL) == target {
+				matches = appendWorkspaceMatch(matches, row.WorkspaceID)
+			}
+		}
+	}
+
 	switch len(matches) {
 	case 0:
 		return fallback
@@ -1278,6 +1298,15 @@ func (h *Handler) resolveWorkspaceForRepo(ctx context.Context, fallback pgtype.U
 		}
 		return matches[0]
 	}
+}
+
+func appendWorkspaceMatch(matches []pgtype.UUID, id pgtype.UUID) []pgtype.UUID {
+	for _, existing := range matches {
+		if existing == id {
+			return matches
+		}
+	}
+	return append(matches, id)
 }
 
 // repoIdentityFromURL returns lowercased "host/owner/name" from an https, scp
