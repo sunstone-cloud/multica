@@ -30,6 +30,10 @@ type deploymentQueueRecoveryWakeService interface {
 	EnqueueTaskForSquadLeaderWithHandoff(context.Context, db.Issue, pgtype.UUID, pgtype.UUID, string) (db.AgentTaskQueue, error)
 }
 
+type deploymentQueueRecoveryTxStarter interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
 // DeploymentQueueRecoveryJob detects waiting deployment queue heads whose
 // blocked_by_deployment target has already reached a terminal outcome. It only
 // recovers one waiting head per workspace/environment and skips environments
@@ -113,11 +117,49 @@ type deploymentQueueCandidate struct {
 // can never observe a rolled-back recovery.
 func RecoverDeploymentQueueStaleBlockers(
 	ctx context.Context,
-	pool *pgxpool.Pool,
+	txStarter deploymentQueueRecoveryTxStarter,
 	queries *db.Queries,
 	waker deploymentQueueRecoveryWakeService,
 ) ([]DeploymentQueueRecoveryResult, error) {
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+	return recoverDeploymentQueue(ctx, txStarter, queries, waker, listRecoverableDeploymentQueueHeads)
+}
+
+// RecoverDeploymentQueueForBlocker is the event-driven path. Call it when a
+// Deployment/TestFlight blocker issue reaches a terminal outcome; it only wakes
+// the queue owner if an eligible waiting item is currently the head of its
+// deployment_env queue.
+func RecoverDeploymentQueueForBlocker(
+	ctx context.Context,
+	txStarter deploymentQueueRecoveryTxStarter,
+	queries *db.Queries,
+	waker deploymentQueueRecoveryWakeService,
+	blocker db.Issue,
+) ([]DeploymentQueueRecoveryResult, error) {
+	results, err := recoverDeploymentQueue(ctx, txStarter, queries, waker, func(ctx context.Context, tx pgx.Tx) ([]deploymentQueueCandidate, error) {
+		return listRecoverableDeploymentQueueHeadsForBlocker(ctx, tx, blocker)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		slog.Info("deployment queue recovery: blocker completion had no eligible waiting queue head",
+			"blocker_id", util.UUIDToString(blocker.ID),
+			"blocker_number", blocker.Number,
+			"blocker_status", blocker.Status)
+	}
+	return results, nil
+}
+
+type deploymentQueueCandidateLister func(context.Context, pgx.Tx) ([]deploymentQueueCandidate, error)
+
+func recoverDeploymentQueue(
+	ctx context.Context,
+	txStarter deploymentQueueRecoveryTxStarter,
+	queries *db.Queries,
+	waker deploymentQueueRecoveryWakeService,
+	listCandidates deploymentQueueCandidateLister,
+) ([]DeploymentQueueRecoveryResult, error) {
+	tx, err := txStarter.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("deployment queue recovery: begin tx: %w", err)
 	}
@@ -125,7 +167,7 @@ func RecoverDeploymentQueueStaleBlockers(
 		_ = tx.Rollback(ctx)
 	}()
 
-	candidates, err := listRecoverableDeploymentQueueHeads(ctx, tx)
+	candidates, err := listCandidates(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -307,6 +349,105 @@ func listRecoverableDeploymentQueueHeads(ctx context.Context, tx pgx.Tx) ([]depl
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("deployment queue recovery: scan heads: %w", err)
+	}
+	return out, nil
+}
+
+func listRecoverableDeploymentQueueHeadsForBlocker(ctx context.Context, tx pgx.Tx, blocker db.Issue) ([]deploymentQueueCandidate, error) {
+	rows, err := tx.Query(ctx, `
+		WITH ranked AS (
+			SELECT
+				i.id,
+				i.workspace_id,
+				i.number,
+				i.position,
+				i.created_at,
+				i.metadata->>'deployment_env' AS env,
+				i.metadata->>'blocked_by_deployment' AS blocker_ref,
+				row_number() OVER (
+					PARTITION BY i.workspace_id, i.metadata->>'deployment_env'
+					ORDER BY i.position ASC, i.created_at DESC
+				) AS rn
+			FROM issue i
+			WHERE i.workspace_id = $1
+			  AND i.status NOT IN ('done', 'cancelled')
+			  AND i.metadata->>'deployment_env' IS NOT NULL
+			  AND i.metadata->>'blocked_by_deployment' IS NOT NULL
+			  AND COALESCE(i.metadata->>'deployment_queue_status', '') IN (
+				'waiting', 'blocked', 'blocked_by_deployment'
+			  )
+		),
+		heads AS (
+			SELECT * FROM ranked WHERE rn = 1
+		)
+		SELECT
+			i.id,
+			i.workspace_id,
+			i.number,
+			h.env,
+			h.blocker_ref,
+			$2::uuid AS blocker_id,
+			$3::int4 AS blocker_number,
+			$4::text AS blocker_status,
+			$5::jsonb AS blocker_metadata,
+			EXISTS (
+				SELECT 1 FROM comment c
+				WHERE c.issue_id = $2::uuid
+				  AND c.content LIKE '%[STAGE:DEPLOY_DONE]%'
+			) AS blocker_has_done_mark,
+			EXISTS (
+				SELECT 1 FROM comment c
+				WHERE c.issue_id = $2::uuid
+				  AND c.content LIKE '%[STAGE:DEPLOY_FAILED]%'
+			) AS blocker_has_fail_mark
+		FROM heads h
+		JOIN issue i ON i.id = h.id
+		WHERE (
+			h.blocker_ref = $2::text
+			OR h.blocker_ref = $3::text
+			OR substring(h.blocker_ref FROM '([0-9]+)$') = $3::text
+		)
+		  AND NOT EXISTS (
+			SELECT 1
+			  FROM issue active
+			 WHERE active.workspace_id = i.workspace_id
+			   AND active.id <> i.id
+			   AND active.status NOT IN ('done', 'cancelled')
+			   AND active.metadata->>'deployment_env' = h.env
+			   AND COALESCE(active.metadata->>'deployment_queue_status', '') IN (
+				'active', 'deploying', 'dispatched', 'in_progress', 'running'
+			   )
+		)
+		ORDER BY i.workspace_id, h.env
+		FOR UPDATE OF i SKIP LOCKED
+	`, blocker.WorkspaceID, blocker.ID, blocker.Number, blocker.Status, blocker.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("deployment queue recovery: list heads for blocker %s: %w", util.UUIDToString(blocker.ID), err)
+	}
+	defer rows.Close()
+
+	var out []deploymentQueueCandidate
+	for rows.Next() {
+		var c deploymentQueueCandidate
+		if err := rows.Scan(
+			&c.IssueID,
+			&c.WorkspaceID,
+			&c.IssueNumber,
+			&c.Environment,
+			&c.BlockerRef,
+			&c.BlockerID,
+			&c.BlockerNumber,
+			&c.BlockerStatus,
+			&c.BlockerMetadata,
+			&c.BlockerHasDoneMark,
+			&c.BlockerHasFailMark,
+		); err != nil {
+			return nil, fmt.Errorf("deployment queue recovery: scan head for blocker: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("deployment queue recovery: scan heads for blocker: %w", err)
 	}
 	return out, nil
 }

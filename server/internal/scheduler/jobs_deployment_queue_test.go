@@ -6,10 +6,244 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+func TestRecoverDeploymentQueueForBlockerEventWakesQueueOwner(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	queries := db.New(pool)
+	wsID := seedDeploymentQueueWorkspace(t, pool)
+	t.Cleanup(func() { cleanupDeploymentQueueWorkspace(t, pool, wsID) })
+	squadID := seedDeploymentQueueSquad(t, pool, wsID)
+
+	blockerID := seedDeploymentQueueIssue(t, pool, deploymentQueueIssue{
+		WorkspaceID: wsID,
+		Number:      933,
+		Title:       "ZHI-933 completed TestFlight",
+		Status:      "done",
+		Position:    -10,
+		Metadata: map[string]string{
+			"deployment_env":          "ios-testflight",
+			"deployment_queue_status": "completed",
+			"testflight_status":       "distributed",
+		},
+	})
+	waitingHead := seedDeploymentQueueIssue(t, pool, deploymentQueueIssue{
+		WorkspaceID:  wsID,
+		Number:       949,
+		Title:        "ZHI-949 waiting on stale blocker",
+		Status:       "todo",
+		Position:     -9,
+		AssigneeType: "squad",
+		AssigneeID:   squadID,
+		Metadata: map[string]string{
+			"deployment_env":          "ios-testflight",
+			"deployment_queue_status": "waiting",
+			"blocked_by_deployment":   "ZHI-933",
+		},
+	})
+	blocker, err := queries.GetIssue(ctx, uuidFromStringForDeploymentQueueTest(t, blockerID))
+	if err != nil {
+		t.Fatalf("load blocker: %v", err)
+	}
+	waker := &deploymentQueueTestWaker{}
+
+	got, err := RecoverDeploymentQueueForBlocker(ctx, pool, queries, waker, blocker)
+	if err != nil {
+		t.Fatalf("RecoverDeploymentQueueForBlocker: %v", err)
+	}
+	if len(got) != 1 || got[0].IssueNumber != 949 {
+		t.Fatalf("expected event recovery for ZHI-949, got %+v", got)
+	}
+	if waker.squadLeaderCalls != 1 {
+		t.Fatalf("expected one squad leader wake, got %d", waker.squadLeaderCalls)
+	}
+	if waker.issueCalls != 0 {
+		t.Fatalf("did not expect direct issue wake, got %d", waker.issueCalls)
+	}
+	md := readIssueMetadata(t, pool, waitingHead)
+	if _, ok := md["blocked_by_deployment"]; ok {
+		t.Fatalf("event recovery did not clear blocker: %v", md)
+	}
+	if md["deployment_queue_status"] != deploymentQueueStatusReady {
+		t.Fatalf("event recovery queue status = %v, want ready", md["deployment_queue_status"])
+	}
+}
+
+func TestRecoverDeploymentQueueForBlockerNoWaitingNoop(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	queries := db.New(pool)
+	wsID := seedDeploymentQueueWorkspace(t, pool)
+	t.Cleanup(func() { cleanupDeploymentQueueWorkspace(t, pool, wsID) })
+
+	blockerID := seedDeploymentQueueIssue(t, pool, deploymentQueueIssue{
+		WorkspaceID: wsID,
+		Number:      933,
+		Title:       "ZHI-933 completed TestFlight",
+		Status:      "done",
+		Position:    -10,
+		Metadata: map[string]string{
+			"deployment_env":          "ios-testflight",
+			"deployment_queue_status": "completed",
+			"testflight_status":       "distributed",
+		},
+	})
+	blocker, err := queries.GetIssue(ctx, uuidFromStringForDeploymentQueueTest(t, blockerID))
+	if err != nil {
+		t.Fatalf("load blocker: %v", err)
+	}
+	waker := &deploymentQueueTestWaker{}
+
+	got, err := RecoverDeploymentQueueForBlocker(ctx, pool, queries, waker, blocker)
+	if err != nil {
+		t.Fatalf("RecoverDeploymentQueueForBlocker: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected no-op with no waiting issues, got %+v", got)
+	}
+	if waker.totalCalls() != 0 {
+		t.Fatalf("no-op should not wake owner, got %d calls", waker.totalCalls())
+	}
+	if n := countIssueComments(t, pool, blockerID); n != 0 {
+		t.Fatalf("no-op should not create noise comments, got %d", n)
+	}
+}
+
+func TestRecoverDeploymentQueueForBlockerRespectsQueueHead(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	queries := db.New(pool)
+	wsID := seedDeploymentQueueWorkspace(t, pool)
+	t.Cleanup(func() { cleanupDeploymentQueueWorkspace(t, pool, wsID) })
+
+	blockerID := seedDeploymentQueueIssue(t, pool, deploymentQueueIssue{
+		WorkspaceID: wsID,
+		Number:      933,
+		Title:       "ZHI-933 completed TestFlight",
+		Status:      "done",
+		Position:    -10,
+		Metadata: map[string]string{
+			"deployment_env":          "ios-testflight",
+			"deployment_queue_status": "completed",
+			"testflight_status":       "distributed",
+		},
+	})
+	head := seedDeploymentQueueIssue(t, pool, deploymentQueueIssue{
+		WorkspaceID: wsID,
+		Number:      948,
+		Title:       "ZHI-948 earlier queue head",
+		Status:      "todo",
+		Position:    -9,
+		Metadata: map[string]string{
+			"deployment_env":          "ios-testflight",
+			"deployment_queue_status": "waiting",
+			"blocked_by_deployment":   "ZHI-900",
+		},
+	})
+	tail := seedDeploymentQueueIssue(t, pool, deploymentQueueIssue{
+		WorkspaceID: wsID,
+		Number:      949,
+		Title:       "ZHI-949 waits on completed blocker but is not head",
+		Status:      "todo",
+		Position:    -8,
+		Metadata: map[string]string{
+			"deployment_env":          "ios-testflight",
+			"deployment_queue_status": "waiting",
+			"blocked_by_deployment":   "ZHI-933",
+		},
+	})
+	blocker, err := queries.GetIssue(ctx, uuidFromStringForDeploymentQueueTest(t, blockerID))
+	if err != nil {
+		t.Fatalf("load blocker: %v", err)
+	}
+	waker := &deploymentQueueTestWaker{}
+
+	got, err := RecoverDeploymentQueueForBlocker(ctx, pool, queries, waker, blocker)
+	if err != nil {
+		t.Fatalf("RecoverDeploymentQueueForBlocker: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("tail item must not recover before queue head, got %+v", got)
+	}
+	if waker.totalCalls() != 0 {
+		t.Fatalf("tail item should not wake owner, got %d calls", waker.totalCalls())
+	}
+	if readIssueMetadata(t, pool, head)["blocked_by_deployment"] != "ZHI-900" {
+		t.Fatalf("unrelated queue head changed")
+	}
+	if readIssueMetadata(t, pool, tail)["blocked_by_deployment"] != "ZHI-933" {
+		t.Fatalf("tail blocker changed before it became head")
+	}
+}
+
+func TestRecoverDeploymentQueueForBlockerSkipsWhenSameEnvironmentActive(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	queries := db.New(pool)
+	wsID := seedDeploymentQueueWorkspace(t, pool)
+	t.Cleanup(func() { cleanupDeploymentQueueWorkspace(t, pool, wsID) })
+
+	blockerID := seedDeploymentQueueIssue(t, pool, deploymentQueueIssue{
+		WorkspaceID: wsID,
+		Number:      933,
+		Title:       "ZHI-933 completed TestFlight",
+		Status:      "done",
+		Position:    -10,
+		Metadata: map[string]string{
+			"deployment_env":          "ios-testflight",
+			"deployment_queue_status": "completed",
+			"testflight_status":       "distributed",
+		},
+	})
+	waiting := seedDeploymentQueueIssue(t, pool, deploymentQueueIssue{
+		WorkspaceID: wsID,
+		Number:      949,
+		Title:       "ZHI-949 waiting on completed blocker",
+		Status:      "todo",
+		Position:    -9,
+		Metadata: map[string]string{
+			"deployment_env":          "ios-testflight",
+			"deployment_queue_status": "waiting",
+			"blocked_by_deployment":   "ZHI-933",
+		},
+	})
+	seedDeploymentQueueIssue(t, pool, deploymentQueueIssue{
+		WorkspaceID: wsID,
+		Number:      950,
+		Title:       "ZHI-950 currently running TestFlight",
+		Status:      "in_progress",
+		Position:    -7,
+		Metadata: map[string]string{
+			"deployment_env":          "ios-testflight",
+			"deployment_queue_status": "running",
+		},
+	})
+	blocker, err := queries.GetIssue(ctx, uuidFromStringForDeploymentQueueTest(t, blockerID))
+	if err != nil {
+		t.Fatalf("load blocker: %v", err)
+	}
+	waker := &deploymentQueueTestWaker{}
+
+	got, err := RecoverDeploymentQueueForBlocker(ctx, pool, queries, waker, blocker)
+	if err != nil {
+		t.Fatalf("RecoverDeploymentQueueForBlocker: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("same-env active deployment must block event recovery, got %+v", got)
+	}
+	if waker.totalCalls() != 0 {
+		t.Fatalf("active deployment should not wake owner, got %d calls", waker.totalCalls())
+	}
+	md := readIssueMetadata(t, pool, waiting)
+	if md["blocked_by_deployment"] != "ZHI-933" || md["deployment_queue_status"] != "waiting" {
+		t.Fatalf("waiting issue changed despite active deployment: %v", md)
+	}
+}
 
 func TestRecoverDeploymentQueueStaleBlockerRestoresOnlyQueueHead(t *testing.T) {
 	pool := integrationPool(t)
@@ -193,12 +427,14 @@ func TestRecoverDeploymentQueueSkipsWhenSameEnvironmentActive(t *testing.T) {
 }
 
 type deploymentQueueIssue struct {
-	WorkspaceID string
-	Number      int
-	Title       string
-	Status      string
-	Position    float64
-	Metadata    map[string]string
+	WorkspaceID  string
+	Number       int
+	Title        string
+	Status       string
+	Position     float64
+	AssigneeType string
+	AssigneeID   string
+	Metadata     map[string]string
 }
 
 func seedDeploymentQueueWorkspace(t *testing.T, pool *pgxpool.Pool) string {
@@ -238,15 +474,59 @@ func seedDeploymentQueueIssue(t *testing.T, pool *pgxpool.Pool, in deploymentQue
 	if err := pool.QueryRow(context.Background(), `
 		INSERT INTO issue (
 			workspace_id, title, description, status, priority,
-			creator_type, creator_id, position, number, metadata
+			creator_type, creator_id, position, number, assignee_type, assignee_id, metadata
 		)
 		VALUES (
 			$1, $2, '', $3, 'high',
-			'agent', gen_random_uuid(), $4, $5, $6::jsonb
+			'agent', gen_random_uuid(), $4, $5, NULLIF($6, '')::text, NULLIF($7, '')::uuid, $8::jsonb
 		)
 		RETURNING id
-	`, in.WorkspaceID, in.Title, in.Status, in.Position, in.Number, string(rawMD)).Scan(&id); err != nil {
+	`, in.WorkspaceID, in.Title, in.Status, in.Position, in.Number, in.AssigneeType, in.AssigneeID, string(rawMD)).Scan(&id); err != nil {
 		t.Fatalf("seed issue %s: %v", in.Title, err)
+	}
+	return id
+}
+
+func seedDeploymentQueueSquad(t *testing.T, pool *pgxpool.Pool, wsID string) string {
+	t.Helper()
+	ctx := context.Background()
+	suffix := uniqueSuffix()
+	var runtimeID, agentID, squadID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status,
+			device_info, metadata, last_seen_at
+		)
+		VALUES ($1, NULL, $2, 'cloud', 'p', 'online', '{}'::jsonb, '{}'::jsonb, now())
+		RETURNING id
+	`, wsID, "deployment-queue-rt-"+suffix).Scan(&runtimeID); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks
+		)
+		VALUES ($1, $2, '', 'cloud', '{}'::jsonb, $3, 'workspace', 1)
+		RETURNING id
+	`, wsID, "deployment-queue-agent-"+suffix, runtimeID).Scan(&agentID); err != nil {
+		t.Fatalf("seed agent: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO squad (workspace_id, name, description, leader_id, creator_id)
+		VALUES ($1, $2, '', $3, gen_random_uuid())
+		RETURNING id
+	`, wsID, "deployment-queue-squad-"+suffix, agentID).Scan(&squadID); err != nil {
+		t.Fatalf("seed squad: %v", err)
+	}
+	return squadID
+}
+
+func uuidFromStringForDeploymentQueueTest(t *testing.T, raw string) pgtype.UUID {
+	t.Helper()
+	var id pgtype.UUID
+	if err := id.Scan(raw); err != nil {
+		t.Fatalf("parse uuid %q: %v", raw, err)
 	}
 	return id
 }
@@ -303,4 +583,23 @@ func TestDeploymentQueueRecoveryCommentForFailedTerminal(t *testing.T) {
 	if !strings.Contains(body, "retry, skip, or escalate") {
 		t.Fatalf("failed terminal comment must route decision back to Athena/owner path: %q", body)
 	}
+}
+
+type deploymentQueueTestWaker struct {
+	issueCalls       int
+	squadLeaderCalls int
+}
+
+func (w *deploymentQueueTestWaker) EnqueueTaskForIssueWithHandoff(context.Context, db.Issue, string) (db.AgentTaskQueue, error) {
+	w.issueCalls++
+	return db.AgentTaskQueue{}, nil
+}
+
+func (w *deploymentQueueTestWaker) EnqueueTaskForSquadLeaderWithHandoff(context.Context, db.Issue, pgtype.UUID, pgtype.UUID, string) (db.AgentTaskQueue, error) {
+	w.squadLeaderCalls++
+	return db.AgentTaskQueue{}, nil
+}
+
+func (w *deploymentQueueTestWaker) totalCalls() int {
+	return w.issueCalls + w.squadLeaderCalls
 }

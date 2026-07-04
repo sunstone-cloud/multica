@@ -195,6 +195,9 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 		"issue_id": uuidToString(updated.ID),
 		"metadata": metadata,
 	})
+	if isDeploymentCompletionMetadataKey(key) && isDeploymentTerminalMetadataValue(req.Value) {
+		h.maybeRecoverDeploymentQueueForBlocker(r.Context(), updated, "issue_metadata_update")
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"metadata": metadata})
 }
 
